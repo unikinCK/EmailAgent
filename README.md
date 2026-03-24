@@ -7,7 +7,8 @@ Python CLI app to organize an IMAP mailbox using a **local LLM** (for example LM
 - Credentials are read from environment variables only.
 - Messages are **never deleted** by this app.
 - Moves are done only with IMAP `MOVE`.
-- If server does not support `MOVE`, processing fails fast (no copy+delete fallback).
+- If server does not support `MOVE`, real processing fails fast (no copy+delete fallback).
+- `--dry-run` can still classify/preview assignments even when `MOVE` is unavailable.
 
 ## Setup
 

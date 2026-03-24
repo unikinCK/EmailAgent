@@ -609,7 +609,10 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
         if not mailbox.supports_move():
-            raise RuntimeError("Server does not advertise IMAP MOVE. Refusing to copy-delete because deletion is forbidden.")
+            if dry_run:
+                print("[WARN] Server does not advertise IMAP MOVE. Continuing because --dry-run was set.")
+            else:
+                raise RuntimeError("Server does not advertise IMAP MOVE. Refusing to copy-delete because deletion is forbidden.")
 
         conn = mailbox._assert_conn()
         sent_references: set[str] = set()
