@@ -43,6 +43,7 @@ class Settings:
     imap_user: str
     imap_password: str
     imap_mailbox: str
+    imap_sent_mailbox: str
     imap_tls: bool
     llm_endpoint: str
     llm_model: str
@@ -60,6 +61,7 @@ class Settings:
             imap_user=env("IMAP_USER", required=True),
             imap_password=env("IMAP_PASSWORD", required=True),
             imap_mailbox=env("IMAP_MAILBOX", "INBOX"),
+            imap_sent_mailbox=env("IMAP_SENT_MAILBOX", "Sent"),
             imap_tls=env("IMAP_TLS", "true").lower() in {"1", "true", "yes", "on"},
             llm_endpoint=env("LLM_ENDPOINT", "http://127.0.0.1:1234/v1/chat/completions"),
             llm_model=env("LLM_MODEL", "local-model"),
@@ -77,6 +79,8 @@ class MessageSummary:
     subject: str
     sender: str
     date: str
+    flags: tuple[str, ...]
+    replied_in_sent: bool
     snippet: str
 
 
@@ -166,6 +170,7 @@ class LocalLLM:
         }
         prompt = (
             "Classify each message into one category name from categories. "
+            "Use provided metadata like flags and replied_in_sent as context signals, but still classify every message. "
             "Return JSON only: {\"assignments\": [{\"uid\":\"...\",\"category\":\"FolderName\",\"confidence\":0.0-1.0,\"reason\":\"short\"}]}. "
             "Always include every uid exactly once."
             f"\nINPUT:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -234,15 +239,23 @@ class ImapMailbox:
             return []
         return data[0].decode("utf-8").split()
 
+    def list_uids_by_criteria(self, criteria: str) -> list[str]:
+        conn = self._assert_conn()
+        status, data = conn.uid("SEARCH", None, criteria)
+        if status != "OK" or not data or not data[0]:
+            return []
+        return data[0].decode("utf-8").split()
+
     def fetch_summaries(self, uids: Iterable[str], snippet_chars: int = 240) -> list[MessageSummary]:
         conn = self._assert_conn()
         result: list[MessageSummary] = []
         for uid in uids:
-            status, data = conn.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] BODY.PEEK[TEXT]<0.1024>)")
+            status, data = conn.uid("FETCH", uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] BODY.PEEK[TEXT]<0.1024>)")
             if status != "OK" or not data:
                 continue
             raw_header = b""
             raw_body = b""
+            flags: tuple[str, ...] = tuple()
             for part in data:
                 if isinstance(part, tuple):
                     raw = part[1]
@@ -250,12 +263,27 @@ class ImapMailbox:
                         raw_header += raw
                     else:
                         raw_body += raw
+                elif isinstance(part, bytes):
+                    line = part.decode("utf-8", errors="ignore")
+                    match = re.search(r"FLAGS \((.*?)\)", line)
+                    if match:
+                        flags = tuple(flag.strip() for flag in match.group(1).split() if flag.strip())
             msg = email.message_from_bytes(raw_header or b"")
             subject = decode_mime(msg.get("Subject", ""))
             sender = decode_mime(msg.get("From", ""))
             date = decode_mime(msg.get("Date", ""))
             snippet = collapse_ws((raw_body or b"").decode(errors="ignore"))[:snippet_chars]
-            result.append(MessageSummary(uid=uid, subject=subject, sender=sender, date=date, snippet=snippet))
+            result.append(
+                MessageSummary(
+                    uid=uid,
+                    subject=subject,
+                    sender=sender,
+                    date=date,
+                    flags=flags,
+                    replied_in_sent=False,
+                    snippet=snippet,
+                )
+            )
         return result
 
     def ensure_folder(self, name: str) -> None:
@@ -285,6 +313,15 @@ def sanitize_folder_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "", name).strip().strip(".")
     cleaned = cleaned.replace("/", "-")
     return cleaned[:60] or "Uncategorized"
+
+
+def normalize_subject(subject: str) -> str:
+    text = collapse_ws(subject).lower()
+    while True:
+        updated = re.sub(r"^(re|fw|fwd)\s*:\s*", "", text).strip()
+        if updated == text:
+            return text
+        text = updated
 
 
 def parse_json_from_text(text: str) -> dict:
@@ -345,6 +382,22 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
         if not mailbox.supports_move():
             raise RuntimeError("Server does not advertise IMAP MOVE. Refusing to copy-delete because deletion is forbidden.")
 
+        conn = mailbox._assert_conn()
+        sent_references: set[str] = set()
+        try:
+            status, _ = conn.select(f'"{settings.imap_sent_mailbox}"', readonly=True)
+            if status == "OK":
+                sent_uids = mailbox.list_uids_by_criteria("ALL")
+                for chunk_start in range(0, len(sent_uids), 200):
+                    chunk = sent_uids[chunk_start : chunk_start + 200]
+                    summaries = mailbox.fetch_summaries(chunk, snippet_chars=0)
+                    for summary in summaries:
+                        if summary.subject:
+                            sent_references.add(normalize_subject(summary.subject))
+            conn.select(f'"{settings.imap_mailbox}"', readonly=False)
+        except Exception:
+            conn.select(f'"{settings.imap_mailbox}"', readonly=False)
+
         all_uids = mailbox.list_uids()
         if max_messages:
             all_uids = all_uids[:max_messages]
@@ -358,6 +411,8 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
         for i in range(0, len(all_uids), batch_size):
             batch_uids = all_uids[i : i + batch_size]
             summaries = mailbox.fetch_summaries(batch_uids)
+            for msg in summaries:
+                msg.replied_in_sent = normalize_subject(msg.subject) in sent_references
             assignments = llm.classify_batch(summaries, categories)
             for msg in summaries:
                 target = assignments.get(msg.uid, "Uncategorized")
