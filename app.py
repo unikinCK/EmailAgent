@@ -530,18 +530,35 @@ def ensure_required_categories(categories: list[dict[str, str]]) -> list[dict[st
     return normalized
 
 
+def render_progress_bar(current: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return "[------------------------------]   0.0%"
+    progress = max(0.0, min(1.0, current / total))
+    filled = min(width, int(progress * width))
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {progress * 100:5.1f}%"
+
+
 def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> None:
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
         all_uids = mailbox.list_uids()
         print(f"Found {len(all_uids)} messages in {settings.imap_mailbox}")
         sample_uids = pick_sample_uids(all_uids, sample_size)
+        total_to_scan = len(sample_uids)
         stop_after_without_new = max(1, math.ceil(len(all_uids) * 0.10))
         running_categories: list[dict[str, str]] = []
         no_new_streak = 0
         scanned = 0
+        attempted = 0
 
         for uid in sample_uids:
+            attempted += 1
+            print(
+                f"\rScan progress {render_progress_bar(attempted, total_to_scan)} ({attempted}/{total_to_scan})",
+                end="",
+                flush=True,
+            )
             sample = mailbox.fetch_summaries([uid])
             if not sample:
                 continue
@@ -559,11 +576,15 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
                 no_new_streak += 1
             running_categories = proposed
             if no_new_streak >= stop_after_without_new:
+                print()
                 print(
                     "Stopping scan early: no new categories in the last "
                     f"{no_new_streak} scanned emails (>=10% of total mailbox: {stop_after_without_new})."
                 )
                 break
+
+        if total_to_scan:
+            print()
 
         consolidated = llm._consolidate_categories(running_categories, max_categories=max_categories)
         plan = CategoryPlan(categories=consolidated)
