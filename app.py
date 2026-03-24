@@ -74,8 +74,8 @@ class Settings:
             llm_timeout_seconds=int(env("LLM_TIMEOUT_SECONDS", "120")),
             llm_temperature=float(env("LLM_TEMPERATURE", "0.1")),
             llm_max_tokens=int(env("LLM_MAX_TOKENS", "700")),
-            llm_max_context_tokens=int(env("LLM_MAX_CONTEXT_TOKENS", "4000")),
-            llm_input_token_budget=int(env("LLM_INPUT_TOKEN_BUDGET", "3000")),
+            llm_max_context_tokens=int(env("LLM_MAX_CONTEXT_TOKENS", "8000")),
+            llm_input_token_budget=int(env("LLM_INPUT_TOKEN_BUDGET", "6000")),
             state_dir=Path(env("STATE_DIR", ".state")),
         )
 
