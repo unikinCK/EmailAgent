@@ -35,6 +35,7 @@ set +a
 | `IMAP_USER` | ✅ | IMAP login username |
 | `IMAP_PASSWORD` | ✅ | IMAP password / app password |
 | `IMAP_MAILBOX` | ❌ | Source mailbox (default `INBOX`) |
+| `IMAP_SENT_MAILBOX` | ❌ | Sent mailbox checked for existing replies (default `Sent`) |
 | `IMAP_TLS` | ❌ | `true/false` (default `true`) |
 | `LLM_ENDPOINT` | ✅ | OpenAI-compatible chat completions URL |
 | `LLM_MODEL` | ✅ | Model name exposed by local runtime |
@@ -73,6 +74,8 @@ Then run real move:
 python app.py process --batch-size 40 --max-messages 500
 ```
 
+During processing, message flags (`\\Seen`, `\\Answered`, etc.) and Sent mailbox matches are included as classification context so the model can make better folder decisions without automatically skipping those messages.
+
 ## Strategy for large mailboxes with a ~20B model
 
 For 100k+ mailboxes, avoid one-shot prompts and process in stages:
@@ -101,4 +104,3 @@ For 100k+ mailboxes, avoid one-shot prompts and process in stages:
 
 - Folder names are sanitized to be IMAP-safe ASCII.
 - If classification is uncertain, fallback category is used.
-
