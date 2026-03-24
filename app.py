@@ -182,11 +182,23 @@ class LocalLLM:
         while self._estimate_tokens(prompt) > self.settings.llm_input_token_budget and len(compact) > 20:
             compact = compact[: int(len(compact) * 0.7)]
             prompt = f"{header}\n\nSAMPLES:\n{json.dumps(compact, ensure_ascii=False)}"
+        messages = [
+            {"role": "system", "content": "Return strict JSON only."},
+            {
+                "role": "user",
+                "content": (
+                    f"{header}\n\n"
+                    f"You will receive {len(compact)} sampled emails as separate messages. "
+                    "Use all of them when proposing categories."
+                ),
+            },
+        ]
+        messages.extend(
+            {"role": "user", "content": json.dumps(sample, ensure_ascii=False)}
+            for sample in compact
+        )
         response = self._post(
-            [
-                {"role": "system", "content": "Return strict JSON only."},
-                {"role": "user", "content": prompt},
-            ],
+            messages,
             max_tokens=900,
         )
         content = self._extract_content(response)
