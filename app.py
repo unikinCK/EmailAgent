@@ -96,6 +96,20 @@ class CategoryPlan:
     categories: list[dict[str, str]]
 
 
+REQUIRED_CATEGORIES: tuple[dict[str, str], ...] = (
+    {
+        "name": "Spam",
+        "description": "Unwanted bulk or promotional messages that are low value.",
+        "rule_hint": "Suspicious marketing bursts, irrelevant offers, or obvious junk.",
+    },
+    {
+        "name": "Phishing",
+        "description": "Potentially malicious emails attempting credential theft or fraud.",
+        "rule_hint": "Urgent account warnings, credential requests, spoofed senders, or scam patterns.",
+    },
+)
+
+
 class LocalLLM:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -393,6 +407,31 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def ensure_required_categories(categories: list[dict[str, str]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    existing_names: set[str] = set()
+    for category in categories:
+        name = sanitize_folder_name(str(category.get("name", "")))
+        if not name or name in existing_names:
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "description": str(category.get("description", "")),
+                "rule_hint": str(category.get("rule_hint", "")),
+            }
+        )
+        existing_names.add(name)
+
+    for required in REQUIRED_CATEGORIES:
+        required_name = required["name"]
+        if required_name not in existing_names:
+            normalized.append(dict(required))
+            existing_names.add(required_name)
+
+    return normalized
+
+
 def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> None:
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
@@ -403,9 +442,10 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
         plan = llm.build_categories(samples, max_categories=max_categories)
 
     categories_file = settings.state_dir / "categories.json"
-    save_json(categories_file, {"generated_at": int(time.time()), "categories": plan.categories})
+    categories = ensure_required_categories(plan.categories)
+    save_json(categories_file, {"generated_at": int(time.time()), "categories": categories})
     print(f"Saved category plan to: {categories_file}")
-    for c in plan.categories:
+    for c in categories:
         print(f"- {c['name']}: {c['description']}")
 
 
@@ -413,7 +453,7 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
     categories_file = settings.state_dir / "categories.json"
     if not categories_file.exists():
         raise RuntimeError("Category plan not found. Run scan first.")
-    categories = load_json(categories_file).get("categories", [])
+    categories = ensure_required_categories(load_json(categories_file).get("categories", []))
     if not categories:
         raise RuntimeError("categories.json has no categories")
 
