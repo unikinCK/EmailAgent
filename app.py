@@ -16,7 +16,6 @@ load_dotenv()
 
 
 import argparse
-import dataclasses
 import email
 import imaplib
 import json
@@ -55,6 +54,8 @@ class Settings:
     llm_timeout_seconds: int
     llm_temperature: float
     llm_max_tokens: int
+    llm_max_context_tokens: int
+    llm_input_token_budget: int
     state_dir: Path
 
     @staticmethod
@@ -73,6 +74,8 @@ class Settings:
             llm_timeout_seconds=int(env("LLM_TIMEOUT_SECONDS", "120")),
             llm_temperature=float(env("LLM_TEMPERATURE", "0.1")),
             llm_max_tokens=int(env("LLM_MAX_TOKENS", "700")),
+            llm_max_context_tokens=int(env("LLM_MAX_CONTEXT_TOKENS", "4000")),
+            llm_input_token_budget=int(env("LLM_INPUT_TOKEN_BUDGET", "3000")),
             state_dir=Path(env("STATE_DIR", ".state")),
         )
 
@@ -98,10 +101,12 @@ class LocalLLM:
         self.settings = settings
 
     def _post(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> dict:
+        requested_max_tokens = max_tokens or self.settings.llm_max_tokens
+        safe_max_tokens = min(requested_max_tokens, max(64, self.settings.llm_max_context_tokens // 2))
         payload = {
             "model": self.settings.llm_model,
             "temperature": self.settings.llm_temperature,
-            "max_tokens": max_tokens or self.settings.llm_max_tokens,
+            "max_tokens": safe_max_tokens,
             "messages": messages,
         }
         body = json.dumps(payload).encode("utf-8")
@@ -133,16 +138,36 @@ class LocalLLM:
             raise RuntimeError("LLM returned empty content")
         return content
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Rough approximation for keeping local-model prompts inside context limits.
+        return max(1, len(text) // 4)
+
+    def _compact_message(self, msg: MessageSummary, snippet_chars: int) -> dict[str, object]:
+        return {
+            "uid": msg.uid,
+            "subject": msg.subject[:140],
+            "sender": msg.sender[:120],
+            "date": msg.date[:64],
+            "flags": list(msg.flags),
+            "replied_in_sent": msg.replied_in_sent,
+            "snippet": msg.snippet[:snippet_chars],
+        }
+
     def build_categories(self, samples: list[MessageSummary], max_categories: int) -> CategoryPlan:
-        sample_json = json.dumps([dataclasses.asdict(s) for s in samples], ensure_ascii=False)
-        prompt = (
+        header = (
             "You are an email triage planner. Propose practical mailbox categories for an IMAP user. "
             f"Output JSON ONLY with schema: {{\"categories\":[{{\"name\":\"FolderName\",\"description\":\"...\",\"rule_hint\":\"...\"}}]}}. "
             f"Use at most {max_categories} categories. Avoid personal/sensitive assumptions. "
             "Prefer stable categories like Bills, Receipts, Work, Newsletters, Travel, Alerts, Personal, Vendors, Promotions, Uncategorized. "
-            "Folder names must be short ASCII and safe for IMAP folder creation.\n\n"
-            f"SAMPLES:\n{sample_json}"
+            "Folder names must be short ASCII and safe for IMAP folder creation."
         )
+        snippet_chars = 120
+        compact = [self._compact_message(sample, snippet_chars=snippet_chars) for sample in samples]
+        prompt = f"{header}\n\nSAMPLES:\n{json.dumps(compact, ensure_ascii=False)}"
+        while self._estimate_tokens(prompt) > self.settings.llm_input_token_budget and len(compact) > 20:
+            compact = compact[: int(len(compact) * 0.7)]
+            prompt = f"{header}\n\nSAMPLES:\n{json.dumps(compact, ensure_ascii=False)}"
         response = self._post(
             [
                 {"role": "system", "content": "Return strict JSON only."},
@@ -168,17 +193,28 @@ class LocalLLM:
         return CategoryPlan(categories=clean_categories)
 
     def classify_batch(self, messages: list[MessageSummary], categories: list[dict[str, str]]) -> dict[str, str]:
-        payload = {
-            "categories": categories,
-            "messages": [dataclasses.asdict(m) for m in messages],
-        }
-        prompt = (
+        prompt_intro = (
             "Classify each message into one category name from categories. "
             "Use provided metadata like flags and replied_in_sent as context signals, but still classify every message. "
             "Return JSON only: {\"assignments\": [{\"uid\":\"...\",\"category\":\"FolderName\",\"confidence\":0.0-1.0,\"reason\":\"short\"}]}. "
             "Always include every uid exactly once."
-            f"\nINPUT:\n{json.dumps(payload, ensure_ascii=False)}"
         )
+        snippet_chars = 160
+        payload = {
+            "categories": categories,
+            "messages": [self._compact_message(m, snippet_chars=snippet_chars) for m in messages],
+        }
+        prompt = f"{prompt_intro}\nINPUT:\n{json.dumps(payload, ensure_ascii=False)}"
+        if self._estimate_tokens(prompt) > self.settings.llm_input_token_budget and len(messages) > 1:
+            midpoint = max(1, len(messages) // 2)
+            first = self.classify_batch(messages[:midpoint], categories)
+            second = self.classify_batch(messages[midpoint:], categories)
+            first.update(second)
+            return first
+        if self._estimate_tokens(prompt) > self.settings.llm_input_token_budget and len(messages) == 1:
+            only = messages[0]
+            payload["messages"] = [self._compact_message(only, snippet_chars=60)]
+            prompt = f"{prompt_intro}\nINPUT:\n{json.dumps(payload, ensure_ascii=False)}"
         response = self._post(
             [
                 {"role": "system", "content": "Return strict JSON only."},
