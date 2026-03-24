@@ -169,54 +169,90 @@ class LocalLLM:
         }
 
     def build_categories(self, samples: list[MessageSummary], max_categories: int) -> CategoryPlan:
-        header = (
-            "You are an email triage planner. Propose practical mailbox categories for an IMAP user. "
-            f"Output JSON ONLY with schema: {{\"categories\":[{{\"name\":\"FolderName\",\"description\":\"...\",\"rule_hint\":\"...\"}}]}}. "
-            f"Use at most {max_categories} categories. Avoid personal/sensitive assumptions. "
-            "Prefer stable categories like Bills, Receipts, Work, Newsletters, Travel, Alerts, Personal, Vendors, Promotions, Uncategorized. "
-            "Folder names must be short ASCII and safe for IMAP folder creation."
-        )
-        snippet_chars = 120
-        compact = [self._compact_message(sample, snippet_chars=snippet_chars) for sample in samples]
-        prompt = f"{header}\n\nSAMPLES:\n{json.dumps(compact, ensure_ascii=False)}"
-        while self._estimate_tokens(prompt) > self.settings.llm_input_token_budget and len(compact) > 20:
-            compact = compact[: int(len(compact) * 0.7)]
-            prompt = f"{header}\n\nSAMPLES:\n{json.dumps(compact, ensure_ascii=False)}"
-        messages = [
-            {"role": "system", "content": "Return strict JSON only."},
-            {
-                "role": "user",
-                "content": (
-                    f"{header}\n\n"
-                    f"You will receive {len(compact)} sampled emails as separate messages. "
-                    "Use all of them when proposing categories."
-                ),
-            },
-        ]
-        messages.extend(
-            {"role": "user", "content": json.dumps(sample, ensure_ascii=False)}
-            for sample in compact
+        if not samples:
+            return CategoryPlan(
+                categories=[{"name": "Uncategorized", "description": "Fallback", "rule_hint": "default"}]
+            )
+
+        categories: list[dict[str, str]] = []
+        for sample in samples:
+            categories = self._propose_categories_for_message(sample, categories, max_categories=max_categories)
+
+        categories = self._consolidate_categories(categories, max_categories=max_categories)
+        if not categories:
+            categories = [{"name": "Uncategorized", "description": "Fallback", "rule_hint": "default"}]
+        return CategoryPlan(categories=categories)
+
+    def _normalize_categories(self, categories: list[dict[str, str]], max_categories: int) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for category in categories:
+            name = sanitize_folder_name(str(category.get("name", "Uncategorized")))
+            if not name or name in seen:
+                continue
+            normalized.append(
+                {
+                    "name": name,
+                    "description": str(category.get("description", "")),
+                    "rule_hint": str(category.get("rule_hint", "")),
+                }
+            )
+            seen.add(name)
+            if len(normalized) >= max_categories:
+                break
+        return normalized
+
+    def _propose_categories_for_message(
+        self,
+        sample: MessageSummary,
+        existing_categories: list[dict[str, str]],
+        max_categories: int,
+    ) -> list[dict[str, str]]:
+        prompt = (
+            "You are an email triage planner. Analyze ONE email and update category plan.\n"
+            f"Return JSON ONLY with schema: {{\"categories\":[{{\"name\":\"FolderName\",\"description\":\"...\",\"rule_hint\":\"...\"}}]}}.\n"
+            f"Keep at most {max_categories} categories total.\n"
+            "Reuse existing categories whenever possible; only add/rename if clearly needed.\n"
+            "Avoid personal/sensitive assumptions.\n"
+            "Prefer stable categories like Bills, Receipts, Work, Newsletters, Travel, Alerts, Personal, Vendors, Promotions, Uncategorized.\n"
+            "Folder names must be short ASCII and safe for IMAP folder creation.\n\n"
+            f"Existing categories:\n{json.dumps(existing_categories, ensure_ascii=False)}\n\n"
+            f"Email:\n{json.dumps(self._compact_message(sample, snippet_chars=160), ensure_ascii=False)}"
         )
         response = self._post(
-            messages,
-            max_tokens=900,
+            [
+                {"role": "system", "content": "Return strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=500,
         )
-        content = self._extract_content(response)
-        data = parse_json_from_text(content)
+        data = parse_json_from_text(self._extract_content(response))
         categories = data.get("categories", [])
-        if not isinstance(categories, list) or not categories:
-            raise RuntimeError("LLM category plan is invalid")
-        clean_categories: list[dict[str, str]] = []
-        for c in categories:
-            name = sanitize_folder_name(str(c.get("name", "Uncategorized")))
-            desc = str(c.get("description", ""))
-            rule_hint = str(c.get("rule_hint", ""))
-            if not name:
-                continue
-            clean_categories.append({"name": name, "description": desc, "rule_hint": rule_hint})
-        if not clean_categories:
-            clean_categories = [{"name": "Uncategorized", "description": "Fallback", "rule_hint": "default"}]
-        return CategoryPlan(categories=clean_categories)
+        if not isinstance(categories, list):
+            return self._normalize_categories(existing_categories, max_categories=max_categories)
+        return self._normalize_categories(categories, max_categories=max_categories)
+
+    def _consolidate_categories(self, categories: list[dict[str, str]], max_categories: int) -> list[dict[str, str]]:
+        prompt = (
+            "You are an email triage planner. Consolidate and deduplicate category candidates.\n"
+            f"Return JSON ONLY with schema: {{\"categories\":[{{\"name\":\"FolderName\",\"description\":\"...\",\"rule_hint\":\"...\"}}]}}.\n"
+            f"Keep at most {max_categories} categories.\n"
+            "Merge near-duplicates, keep category names short ASCII, and preserve broad useful coverage.\n"
+            "Prefer stable categories like Bills, Receipts, Work, Newsletters, Travel, Alerts, Personal, Vendors, Promotions, Uncategorized.\n\n"
+            f"Candidate categories:\n{json.dumps(categories, ensure_ascii=False)}"
+        )
+        response = self._post(
+            [
+                {"role": "system", "content": "Return strict JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=700,
+        )
+        data = parse_json_from_text(self._extract_content(response))
+        consolidated = data.get("categories", [])
+        if not isinstance(consolidated, list):
+            return self._normalize_categories(categories, max_categories=max_categories)
+        return self._normalize_categories(consolidated, max_categories=max_categories)
 
     def classify_batch(self, messages: list[MessageSummary], categories: list[dict[str, str]]) -> dict[str, str]:
         prompt_intro = (
