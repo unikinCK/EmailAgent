@@ -43,6 +43,8 @@ set +a
 | `LLM_TIMEOUT_SECONDS` | ❌ | HTTP timeout (default `120`) |
 | `LLM_TEMPERATURE` | ❌ | Generation temperature (default `0.1`) |
 | `LLM_MAX_TOKENS` | ❌ | Completion cap (default `700`) |
+| `LLM_MAX_CONTEXT_TOKENS` | ❌ | Model context window used for safety clamping (default `4000`) |
+| `LLM_INPUT_TOKEN_BUDGET` | ❌ | Approx max prompt tokens kept per request (default `3000`) |
 | `STATE_DIR` | ❌ | Local state path (default `.state`) |
 
 ## Workflow
@@ -91,6 +93,7 @@ For 100k+ mailboxes, avoid one-shot prompts and process in stages:
 3. **Token control**
    - Keep batch size moderate (`20-60`) so each prompt fits context.
    - Use short snippets (`~240 chars`) and headers for high signal/low token cost.
+   - If your local server has a 4k context, keep `LLM_INPUT_TOKEN_BUDGET` around `3000`.
 
 4. **Category stability**
    - Reuse saved `.state/categories.json` for consistency across runs.
