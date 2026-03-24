@@ -428,14 +428,37 @@ def normalize_subject(subject: str) -> str:
 
 def parse_json_from_text(text: str) -> dict:
     text = text.strip()
+    decoder = json.JSONDecoder()
+
+    def _decode_first_object(candidate: str) -> dict | None:
+        for match in re.finditer(r"\{", candidate):
+            start = match.start()
+            try:
+                obj, _ = decoder.raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+        return None
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise RuntimeError("LLM output is not valid JSON")
-        return json.loads(text[start : end + 1])
+        pass
+
+    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if fenced != text:
+        try:
+            return json.loads(fenced)
+        except json.JSONDecodeError:
+            pass
+
+    decoded = _decode_first_object(fenced)
+    if decoded is not None:
+        return decoded
+
+    preview = collapse_ws(text)[:240]
+    raise RuntimeError(f"LLM output is not valid JSON: {preview}")
 
 
 def pick_sample_uids(uids: list[str], sample_size: int) -> list[str]:
