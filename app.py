@@ -19,6 +19,7 @@ import argparse
 import email
 import imaplib
 import json
+import math
 import os
 import re
 import ssl
@@ -68,7 +69,7 @@ class Settings:
             imap_mailbox=env("IMAP_MAILBOX", "INBOX"),
             imap_sent_mailbox=env("IMAP_SENT_MAILBOX", "Sent"),
             imap_tls=env("IMAP_TLS", "true").lower() in {"1", "true", "yes", "on"},
-            llm_endpoint=env("LLM_ENDPOINT", "http://127.0.0.1:1234/v1/chat/completions"),
+            llm_endpoint=env("LLM_ENDPOINT", "http://127.0.0.1:1234/v1/responses"),
             llm_model=env("LLM_MODEL", "local-model"),
             llm_api_key=env("LLM_API_KEY", ""),
             llm_timeout_seconds=int(env("LLM_TIMEOUT_SECONDS", "120")),
@@ -117,12 +118,22 @@ class LocalLLM:
     def _post(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> dict:
         requested_max_tokens = max_tokens or self.settings.llm_max_tokens
         safe_max_tokens = min(requested_max_tokens, max(64, self.settings.llm_max_context_tokens // 2))
-        payload = {
-            "model": self.settings.llm_model,
-            "temperature": self.settings.llm_temperature,
-            "max_tokens": safe_max_tokens,
-            "messages": messages,
-        }
+        if "/responses" in self.settings.llm_endpoint:
+            payload = {
+                "model": self.settings.llm_model,
+                "temperature": self.settings.llm_temperature,
+                "max_output_tokens": safe_max_tokens,
+                "input": messages,
+                "text": {"format": {"type": "json_object"}},
+            }
+        else:
+            payload = {
+                "model": self.settings.llm_model,
+                "temperature": self.settings.llm_temperature,
+                "max_tokens": safe_max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": messages,
+            }
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.settings.llm_api_key:
@@ -144,6 +155,22 @@ class LocalLLM:
 
     @staticmethod
     def _extract_content(response: dict) -> str:
+        if isinstance(response.get("output"), list):
+            chunks: list[str] = []
+            for item in response["output"]:
+                if not isinstance(item, dict):
+                    continue
+                for content in item.get("content", []):
+                    if not isinstance(content, dict):
+                        continue
+                    if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
+                        chunks.append(content["text"])
+            if chunks:
+                return "\n".join(chunks).strip()
+
+        if isinstance(response.get("output_text"), str) and response["output_text"].strip():
+            return response["output_text"].strip()
+
         choices = response.get("choices", [])
         if not choices:
             raise RuntimeError("LLM returned no choices")
@@ -509,8 +536,38 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
         all_uids = mailbox.list_uids()
         print(f"Found {len(all_uids)} messages in {settings.imap_mailbox}")
         sample_uids = pick_sample_uids(all_uids, sample_size)
-        samples = mailbox.fetch_summaries(sample_uids)
-        plan = llm.build_categories(samples, max_categories=max_categories)
+        stop_after_without_new = max(1, math.ceil(len(all_uids) * 0.10))
+        running_categories: list[dict[str, str]] = []
+        no_new_streak = 0
+        scanned = 0
+
+        for uid in sample_uids:
+            sample = mailbox.fetch_summaries([uid])
+            if not sample:
+                continue
+            scanned += 1
+            before_names = {c["name"] for c in running_categories}
+            proposed = llm._propose_categories_for_message(
+                sample[0],
+                running_categories,
+                max_categories=max_categories,
+            )
+            after_names = {c["name"] for c in proposed}
+            if len(after_names - before_names) > 0:
+                no_new_streak = 0
+            else:
+                no_new_streak += 1
+            running_categories = proposed
+            if no_new_streak >= stop_after_without_new:
+                print(
+                    "Stopping scan early: no new categories in the last "
+                    f"{no_new_streak} scanned emails (>=10% of total mailbox: {stop_after_without_new})."
+                )
+                break
+
+        consolidated = llm._consolidate_categories(running_categories, max_categories=max_categories)
+        plan = CategoryPlan(categories=consolidated)
+        print(f"Scanned {scanned} sampled messages for category discovery.")
 
     categories_file = settings.state_dir / "categories.json"
     categories = ensure_required_categories(plan.categories)
