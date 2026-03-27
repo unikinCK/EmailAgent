@@ -6,7 +6,7 @@ Features:
 - Never deletes messages. It uses IMAP `MOVE` and will skip messages if MOVE is unsupported.
 - Two-pass strategy for large mailboxes:
   1) Scan phase builds candidate categories from a representative sample.
-  2) Process phase classifies and moves messages in batches.
+  2) Process phase classifies and moves messages one-by-one for higher assignment quality.
 """
 
 from __future__ import annotations
@@ -634,14 +634,19 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
         if max_messages:
             all_uids = all_uids[:max_messages]
 
-        print(f"Processing {len(all_uids)} messages in batches of {batch_size}")
+        if batch_size != 1:
+            print(
+                "[WARN] Batch processing is disabled for classification quality; forcing effective batch size to 1."
+            )
+        effective_batch_size = 1
+        print(f"Processing {len(all_uids)} messages with effective batch size of {effective_batch_size}")
         for c in categories:
             mailbox.ensure_folder(c["name"])
 
         moved = 0
         skipped = 0
-        for i in range(0, len(all_uids), batch_size):
-            batch_uids = all_uids[i : i + batch_size]
+        for i in range(0, len(all_uids), effective_batch_size):
+            batch_uids = all_uids[i : i + effective_batch_size]
             summaries = mailbox.fetch_summaries(batch_uids)
             for msg in summaries:
                 msg.replied_in_sent = normalize_subject(msg.subject) in sent_references
@@ -670,7 +675,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scan.add_argument("--max-categories", type=int, default=12, help="Maximum category count")
 
     process = sub.add_parser("process", help="Classify and move messages using categories.json")
-    process.add_argument("--batch-size", type=int, default=40, help="LLM batch size")
+    process.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Deprecated and ignored: processing always uses effective batch size 1 for quality",
+    )
     process.add_argument("--max-messages", type=int, default=None, help="Optional cap for safer staged runs")
     process.add_argument("--dry-run", action="store_true", help="Only print actions, do not move")
 

@@ -68,13 +68,13 @@ This phase:
 Start safely with dry-run:
 
 ```bash
-python app.py process --batch-size 40 --max-messages 500 --dry-run
+python app.py process --max-messages 500 --dry-run
 ```
 
 Then run real move:
 
 ```bash
-python app.py process --batch-size 40 --max-messages 500
+python app.py process --max-messages 500
 ```
 
 During processing, message flags (`\\Seen`, `\\Answered`, etc.) and Sent mailbox matches are included as classification context so the model can make better folder decisions without automatically skipping those messages.
@@ -92,7 +92,7 @@ For 100k+ mailboxes, avoid one-shot prompts and process in stages:
    - Increase gradually (5k, 20k, full).
 
 3. **Token control**
-   - Keep batch size moderate (`20-60`) so each prompt fits context.
+   - Processing now classifies one message per prompt (effective batch size is always `1`) for better quality.
    - Use short snippets (`~240 chars`) and headers for high signal/low token cost.
    - If your local server has a 4k context, keep `LLM_INPUT_TOKEN_BUDGET` around `3000`.
 
@@ -102,7 +102,7 @@ For 100k+ mailboxes, avoid one-shot prompts and process in stages:
 
 5. **Operational resilience**
    - Use low temperature for deterministic categorization.
-   - Retry failed batches externally via rerun; script is idempotent enough for repeated passes.
+   - Retry failed messages externally via rerun; script is idempotent enough for repeated passes.
 
 ## Notes
 
