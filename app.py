@@ -3,7 +3,7 @@
 
 Features:
 - Reads IMAP + LLM settings from environment variables.
-- Never deletes messages. It uses IMAP `MOVE` and will skip messages if MOVE is unsupported.
+- Moves with IMAP `MOVE` when supported; optional copy+delete fallback is available.
 - Two-pass strategy for large mailboxes:
   1) Scan phase builds candidate categories from a representative sample.
   2) Process phase classifies and moves messages one-by-one for higher assignment quality.
@@ -426,6 +426,21 @@ class ImapMailbox:
         status, _ = conn.uid("MOVE", uid, f'"{folder}"')
         return status == "OK"
 
+    def copy_uid(self, uid: str, folder: str) -> bool:
+        conn = self._assert_conn()
+        status, _ = conn.uid("COPY", uid, f'"{folder}"')
+        return status == "OK"
+
+    def mark_deleted_uid(self, uid: str) -> bool:
+        conn = self._assert_conn()
+        status, _ = conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Deleted)")
+        return status == "OK"
+
+    def expunge(self) -> bool:
+        conn = self._assert_conn()
+        status, _ = conn.expunge()
+        return status == "OK"
+
 
 def decode_mime(value: str) -> str:
     try:
@@ -598,7 +613,13 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
         print(f"- {c['name']}: {c['description']}")
 
 
-def process_phase(settings: Settings, batch_size: int, max_messages: int | None, dry_run: bool) -> None:
+def process_phase(
+    settings: Settings,
+    batch_size: int,
+    max_messages: int | None,
+    dry_run: bool,
+    allow_copy_delete_fallback: bool,
+) -> None:
     categories_file = settings.state_dir / "categories.json"
     if not categories_file.exists():
         raise RuntimeError("Category plan not found. Run scan first.")
@@ -608,11 +629,16 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
 
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
-        if not mailbox.supports_move():
+        supports_move = mailbox.supports_move()
+        if not supports_move:
             if dry_run:
                 print("[WARN] Server does not advertise IMAP MOVE. Continuing because --dry-run was set.")
+            elif allow_copy_delete_fallback:
+                print("[WARN] Server does not advertise IMAP MOVE. Using copy+delete fallback because --allow-copy-delete-fallback was set.")
             else:
-                raise RuntimeError("Server does not advertise IMAP MOVE. Refusing to copy-delete because deletion is forbidden.")
+                raise RuntimeError(
+                    "Server does not advertise IMAP MOVE. Refusing to copy-delete unless --allow-copy-delete-fallback is set."
+                )
 
         conn = mailbox._assert_conn()
         sent_references: set[str] = set()
@@ -657,7 +683,13 @@ def process_phase(settings: Settings, batch_size: int, max_messages: int | None,
                     print(f"[DRY-RUN] uid={msg.uid} -> {target} | {msg.subject[:70]}")
                     skipped += 1
                     continue
-                ok = mailbox.move_uid(msg.uid, target)
+                if supports_move:
+                    ok = mailbox.move_uid(msg.uid, target)
+                else:
+                    copied = mailbox.copy_uid(msg.uid, target)
+                    deleted = copied and mailbox.mark_deleted_uid(msg.uid)
+                    expunged = deleted and mailbox.expunge()
+                    ok = copied and deleted and expunged
                 if ok:
                     moved += 1
                 else:
@@ -683,6 +715,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     process.add_argument("--max-messages", type=int, default=None, help="Optional cap for safer staged runs")
     process.add_argument("--dry-run", action="store_true", help="Only print actions, do not move")
+    process.add_argument(
+        "--allow-copy-delete-fallback",
+        action="store_true",
+        help="If MOVE is unavailable, allow COPY + \\Deleted + EXPUNGE fallback",
+    )
 
     return parser.parse_args(argv)
 
@@ -699,6 +736,7 @@ def main(argv: list[str]) -> int:
             batch_size=args.batch_size,
             max_messages=args.max_messages,
             dry_run=args.dry_run,
+            allow_copy_delete_fallback=args.allow_copy_delete_fallback,
         )
     else:
         raise RuntimeError(f"Unknown command: {args.command}")

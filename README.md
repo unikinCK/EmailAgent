@@ -5,9 +5,9 @@ Python CLI app to organize an IMAP mailbox using a **local LLM** (for example LM
 ## Safety guarantees
 
 - Credentials are read from environment variables only.
-- Messages are **never deleted** by this app.
-- Moves are done only with IMAP `MOVE`.
-- If server does not support `MOVE`, real processing fails fast (no copy+delete fallback).
+- By default, messages are **not deleted** by this app.
+- Moves are done with IMAP `MOVE` when available.
+- If server does not support `MOVE`, real processing fails fast unless `--allow-copy-delete-fallback` is set.
 - `--dry-run` can still classify/preview assignments even when `MOVE` is unavailable.
 
 ## Setup
@@ -75,6 +75,12 @@ Then run real move:
 
 ```bash
 python app.py process --max-messages 500
+```
+
+If your server does not support `MOVE`, you can opt in to a fallback mode that does `COPY` then marks originals `\\Deleted` and runs `EXPUNGE`:
+
+```bash
+python app.py process --max-messages 500 --allow-copy-delete-fallback
 ```
 
 During processing, message flags (`\\Seen`, `\\Answered`, etc.) and Sent mailbox matches are included as classification context so the model can make better folder decisions without automatically skipping those messages.
