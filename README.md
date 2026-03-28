@@ -1,6 +1,6 @@
 # EmailAgent
 
-Python CLI app to organize an IMAP mailbox using a **local LLM** (for example LM Studio).
+Python CLI app (plus optional Flask web UI) to organize an IMAP mailbox using a **local LLM** (for example LM Studio).
 
 ## Safety guarantees
 
@@ -18,6 +18,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
+
+> Requires Python packages from `requirements.txt` (including `Flask` and `python-dotenv`).
 
 Load env values:
 
@@ -84,6 +86,25 @@ python app.py process --max-messages 500 --allow-copy-delete-fallback
 ```
 
 During processing, message flags (`\\Seen`, `\\Answered`, etc.) and Sent mailbox matches are included as classification context so the model can make better folder decisions without automatically skipping those messages.
+
+## Web UI (event-orientiert)
+
+Start the web server:
+
+```bash
+python app.py serve --host 127.0.0.1 --port 8080
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080
+```
+
+The UI supports:
+- Editing/saving config values to `.env`
+- Starting scan/process actions
+- Live-ish event log updates via background job polling
 
 ## Strategy for large mailboxes with a ~20B model
 

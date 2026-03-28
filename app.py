@@ -27,10 +27,15 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from email.header import decode_header, make_header
 from pathlib import Path
-from typing import Iterable
+from threading import Lock, Thread
+from typing import Callable, Iterable
+
+from dotenv import dotenv_values
+from flask import Flask, Response, jsonify, render_template, request
 
 
 def env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -60,25 +65,36 @@ class Settings:
     state_dir: Path
 
     @staticmethod
-    def from_env() -> "Settings":
+    def from_mapping(values: dict[str, str | None]) -> "Settings":
+        def pick(name: str, default: str | None = None, required: bool = False) -> str:
+            raw = values.get(name, default)
+            if required and not raw:
+                raise ValueError(f"Missing required configuration value: {name}")
+            return raw or ""
+
         return Settings(
-            imap_host=env("IMAP_HOST", required=True),
-            imap_port=int(env("IMAP_PORT", "993")),
-            imap_user=env("IMAP_USER", required=True),
-            imap_password=env("IMAP_PASSWORD", required=True),
-            imap_mailbox=env("IMAP_MAILBOX", "INBOX"),
-            imap_sent_mailbox=env("IMAP_SENT_MAILBOX", "Sent"),
-            imap_tls=env("IMAP_TLS", "true").lower() in {"1", "true", "yes", "on"},
-            llm_endpoint=env("LLM_ENDPOINT", "http://127.0.0.1:1234/v1/responses"),
-            llm_model=env("LLM_MODEL", "local-model"),
-            llm_api_key=env("LLM_API_KEY", ""),
-            llm_timeout_seconds=int(env("LLM_TIMEOUT_SECONDS", "120")),
-            llm_temperature=float(env("LLM_TEMPERATURE", "0.1")),
-            llm_max_tokens=int(env("LLM_MAX_TOKENS", "700")),
-            llm_max_context_tokens=int(env("LLM_MAX_CONTEXT_TOKENS", "8000")),
-            llm_input_token_budget=int(env("LLM_INPUT_TOKEN_BUDGET", "6000")),
-            state_dir=Path(env("STATE_DIR", ".state")),
+            imap_host=pick("IMAP_HOST", required=True),
+            imap_port=int(pick("IMAP_PORT", "993")),
+            imap_user=pick("IMAP_USER", required=True),
+            imap_password=pick("IMAP_PASSWORD", required=True),
+            imap_mailbox=pick("IMAP_MAILBOX", "INBOX"),
+            imap_sent_mailbox=pick("IMAP_SENT_MAILBOX", "Sent"),
+            imap_tls=pick("IMAP_TLS", "true").lower() in {"1", "true", "yes", "on"},
+            llm_endpoint=pick("LLM_ENDPOINT", "http://127.0.0.1:1234/v1/responses"),
+            llm_model=pick("LLM_MODEL", "local-model"),
+            llm_api_key=pick("LLM_API_KEY", ""),
+            llm_timeout_seconds=int(pick("LLM_TIMEOUT_SECONDS", "120")),
+            llm_temperature=float(pick("LLM_TEMPERATURE", "0.1")),
+            llm_max_tokens=int(pick("LLM_MAX_TOKENS", "700")),
+            llm_max_context_tokens=int(pick("LLM_MAX_CONTEXT_TOKENS", "8000")),
+            llm_input_token_budget=int(pick("LLM_INPUT_TOKEN_BUDGET", "6000")),
+            state_dir=Path(pick("STATE_DIR", ".state")),
         )
+
+    @staticmethod
+    def from_env() -> "Settings":
+        mapping = {k: os.getenv(k) for k in CONFIG_KEYS}
+        return Settings.from_mapping(mapping)
 
 
 @dataclass
@@ -109,6 +125,27 @@ REQUIRED_CATEGORIES: tuple[dict[str, str], ...] = (
         "rule_hint": "Urgent account warnings, credential requests, spoofed senders, or scam patterns.",
     },
 )
+
+CONFIG_KEYS: tuple[str, ...] = (
+    "IMAP_HOST",
+    "IMAP_PORT",
+    "IMAP_USER",
+    "IMAP_PASSWORD",
+    "IMAP_MAILBOX",
+    "IMAP_SENT_MAILBOX",
+    "IMAP_TLS",
+    "LLM_ENDPOINT",
+    "LLM_MODEL",
+    "LLM_API_KEY",
+    "LLM_TIMEOUT_SECONDS",
+    "LLM_TEMPERATURE",
+    "LLM_MAX_TOKENS",
+    "LLM_MAX_CONTEXT_TOKENS",
+    "LLM_INPUT_TOKEN_BUDGET",
+    "STATE_DIR",
+)
+
+ENV_FILE = Path(".env")
 
 
 class LocalLLM:
@@ -554,11 +591,16 @@ def render_progress_bar(current: int, total: int, width: int = 30) -> str:
     return f"[{bar}] {progress * 100:5.1f}%"
 
 
-def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> None:
+def scan_phase(
+    settings: Settings,
+    sample_size: int,
+    max_categories: int,
+    out: Callable[..., None] = print,
+) -> None:
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
         all_uids = mailbox.list_uids()
-        print(f"Found {len(all_uids)} messages in {settings.imap_mailbox}")
+        out(f"Found {len(all_uids)} messages in {settings.imap_mailbox}")
         sample_uids = pick_sample_uids(all_uids, sample_size)
         total_to_scan = len(sample_uids)
         stop_after_without_new = max(1, math.ceil(len(all_uids) * 0.10))
@@ -569,7 +611,7 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
 
         for uid in sample_uids:
             attempted += 1
-            print(
+            out(
                 f"\rScan progress {render_progress_bar(attempted, total_to_scan)} ({attempted}/{total_to_scan})",
                 end="",
                 flush=True,
@@ -591,26 +633,26 @@ def scan_phase(settings: Settings, sample_size: int, max_categories: int) -> Non
                 no_new_streak += 1
             running_categories = proposed
             if no_new_streak >= stop_after_without_new:
-                print()
-                print(
+                out()
+                out(
                     "Stopping scan early: no new categories in the last "
                     f"{no_new_streak} scanned emails (>=10% of total mailbox: {stop_after_without_new})."
                 )
                 break
 
         if total_to_scan:
-            print()
+            out()
 
         consolidated = llm._consolidate_categories(running_categories, max_categories=max_categories)
         plan = CategoryPlan(categories=consolidated)
-        print(f"Scanned {scanned} sampled messages for category discovery.")
+        out(f"Scanned {scanned} sampled messages for category discovery.")
 
     categories_file = settings.state_dir / "categories.json"
     categories = ensure_required_categories(plan.categories)
     save_json(categories_file, {"generated_at": int(time.time()), "categories": categories})
-    print(f"Saved category plan to: {categories_file}")
+    out(f"Saved category plan to: {categories_file}")
     for c in categories:
-        print(f"- {c['name']}: {c['description']}")
+        out(f"- {c['name']}: {c['description']}")
 
 
 def process_phase(
@@ -619,6 +661,7 @@ def process_phase(
     max_messages: int | None,
     dry_run: bool,
     allow_copy_delete_fallback: bool,
+    out: Callable[..., None] = print,
 ) -> None:
     categories_file = settings.state_dir / "categories.json"
     if not categories_file.exists():
@@ -632,9 +675,9 @@ def process_phase(
         supports_move = mailbox.supports_move()
         if not supports_move:
             if dry_run:
-                print("[WARN] Server does not advertise IMAP MOVE. Continuing because --dry-run was set.")
+                out("[WARN] Server does not advertise IMAP MOVE. Continuing because --dry-run was set.")
             elif allow_copy_delete_fallback:
-                print("[WARN] Server does not advertise IMAP MOVE. Using copy+delete fallback because --allow-copy-delete-fallback was set.")
+                out("[WARN] Server does not advertise IMAP MOVE. Using copy+delete fallback because --allow-copy-delete-fallback was set.")
             else:
                 raise RuntimeError(
                     "Server does not advertise IMAP MOVE. Refusing to copy-delete unless --allow-copy-delete-fallback is set."
@@ -661,11 +704,11 @@ def process_phase(
             all_uids = all_uids[:max_messages]
 
         if batch_size != 1:
-            print(
+            out(
                 "[WARN] Batch processing is disabled for classification quality; forcing effective batch size to 1."
             )
         effective_batch_size = 1
-        print(f"Processing {len(all_uids)} messages with effective batch size of {effective_batch_size}")
+        out(f"Processing {len(all_uids)} messages with effective batch size of {effective_batch_size}")
         for c in categories:
             mailbox.ensure_folder(c["name"])
 
@@ -680,7 +723,7 @@ def process_phase(
             for msg in summaries:
                 target = assignments.get(msg.uid, "Uncategorized")
                 if dry_run:
-                    print(f"[DRY-RUN] uid={msg.uid} -> {target} | {msg.subject[:70]}")
+                    out(f"[DRY-RUN] uid={msg.uid} -> {target} | {msg.subject[:70]}")
                     skipped += 1
                     continue
                 if supports_move:
@@ -694,8 +737,189 @@ def process_phase(
                     moved += 1
                 else:
                     skipped += 1
-                    print(f"[WARN] failed to move uid={msg.uid} to {target}")
-        print(f"Done. moved={moved}, skipped={skipped}, dry_run={dry_run}")
+                    out(f"[WARN] failed to move uid={msg.uid} to {target}")
+        out(f"Done. moved={moved}, skipped={skipped}, dry_run={dry_run}")
+
+
+def parse_bool(raw: str | None, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_config() -> dict[str, str]:
+    file_values = {k: str(v) for k, v in dotenv_values(ENV_FILE).items() if v is not None}
+    merged: dict[str, str] = {}
+    for key in CONFIG_KEYS:
+        env_value = os.getenv(key)
+        if env_value is not None:
+            merged[key] = env_value
+        elif key in file_values:
+            merged[key] = file_values[key]
+    if "IMAP_PORT" not in merged:
+        merged["IMAP_PORT"] = "993"
+    if "IMAP_MAILBOX" not in merged:
+        merged["IMAP_MAILBOX"] = "INBOX"
+    if "IMAP_SENT_MAILBOX" not in merged:
+        merged["IMAP_SENT_MAILBOX"] = "Sent"
+    if "IMAP_TLS" not in merged:
+        merged["IMAP_TLS"] = "true"
+    if "LLM_ENDPOINT" not in merged:
+        merged["LLM_ENDPOINT"] = "http://127.0.0.1:1234/v1/responses"
+    if "LLM_MODEL" not in merged:
+        merged["LLM_MODEL"] = "local-model"
+    if "LLM_TIMEOUT_SECONDS" not in merged:
+        merged["LLM_TIMEOUT_SECONDS"] = "120"
+    if "LLM_TEMPERATURE" not in merged:
+        merged["LLM_TEMPERATURE"] = "0.1"
+    if "LLM_MAX_TOKENS" not in merged:
+        merged["LLM_MAX_TOKENS"] = "700"
+    if "LLM_MAX_CONTEXT_TOKENS" not in merged:
+        merged["LLM_MAX_CONTEXT_TOKENS"] = "8000"
+    if "LLM_INPUT_TOKEN_BUDGET" not in merged:
+        merged["LLM_INPUT_TOKEN_BUDGET"] = "6000"
+    if "STATE_DIR" not in merged:
+        merged["STATE_DIR"] = ".state"
+    return merged
+
+
+def save_config(values: dict[str, str]) -> None:
+    lines: list[str] = []
+    for key in CONFIG_KEYS:
+        val = values.get(key)
+        if val is None:
+            continue
+        escaped = val.replace("\\", "\\\\").replace("\n", "\\n")
+        lines.append(f"{key}={escaped}")
+    ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def create_web_app() -> Flask:
+    app = Flask(__name__)
+    jobs: dict[str, dict[str, object]] = {}
+    jobs_lock = Lock()
+
+    def create_job(name: str) -> str:
+        job_id = uuid.uuid4().hex[:10]
+        with jobs_lock:
+            jobs[job_id] = {
+                "id": job_id,
+                "name": name,
+                "status": "queued",
+                "logs": [],
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
+            }
+        return job_id
+
+    def append_log(job_id: str, message: str) -> None:
+        with jobs_lock:
+            job = jobs[job_id]
+            log_item = {"ts": int(time.time()), "message": message}
+            cast_logs = job["logs"]
+            if isinstance(cast_logs, list):
+                cast_logs.append(log_item)
+            job["updated_at"] = int(time.time())
+
+    def set_status(job_id: str, status: str) -> None:
+        with jobs_lock:
+            jobs[job_id]["status"] = status
+            jobs[job_id]["updated_at"] = int(time.time())
+
+    def fail_job(job_id: str, error: str) -> None:
+        append_log(job_id, f"[ERROR] {error}")
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = error
+            jobs[job_id]["updated_at"] = int(time.time())
+
+    def run_scan_job(job_id: str, config: dict[str, str], sample_size: int, max_categories: int) -> None:
+        set_status(job_id, "running")
+        try:
+            settings = Settings.from_mapping(config)
+            scan_phase(settings, sample_size=sample_size, max_categories=max_categories, out=lambda *a, **k: append_log(job_id, " ".join(str(x) for x in a)))
+            set_status(job_id, "done")
+        except Exception as exc:
+            fail_job(job_id, str(exc))
+
+    def run_process_job(
+        job_id: str,
+        config: dict[str, str],
+        max_messages: int | None,
+        dry_run: bool,
+        allow_copy_delete_fallback: bool,
+    ) -> None:
+        set_status(job_id, "running")
+        try:
+            settings = Settings.from_mapping(config)
+            process_phase(
+                settings,
+                batch_size=1,
+                max_messages=max_messages,
+                dry_run=dry_run,
+                allow_copy_delete_fallback=allow_copy_delete_fallback,
+                out=lambda *a, **k: append_log(job_id, " ".join(str(x) for x in a)),
+            )
+            set_status(job_id, "done")
+        except Exception as exc:
+            fail_job(job_id, str(exc))
+
+    @app.get("/")
+    def index() -> str:
+        return render_template("index.html")
+
+    @app.get("/api/config")
+    def api_get_config() -> Response:
+        return jsonify({"config": load_config()})
+
+    @app.post("/api/config")
+    def api_save_config() -> Response:
+        payload = request.get_json(silent=True) or {}
+        config = payload.get("config", {})
+        clean: dict[str, str] = {}
+        for key in CONFIG_KEYS:
+            if key in config:
+                clean[key] = str(config[key])
+        save_config(clean)
+        return jsonify({"ok": True, "config": clean})
+
+    @app.post("/api/run/scan")
+    def api_run_scan() -> Response:
+        payload = request.get_json(silent=True) or {}
+        config = load_config()
+        sample_size = int(payload.get("sample_size", 600))
+        max_categories = int(payload.get("max_categories", 12))
+        job_id = create_job("scan")
+        thread = Thread(target=run_scan_job, args=(job_id, config, sample_size, max_categories), daemon=True)
+        thread.start()
+        return jsonify({"ok": True, "job_id": job_id})
+
+    @app.post("/api/run/process")
+    def api_run_process() -> Response:
+        payload = request.get_json(silent=True) or {}
+        config = load_config()
+        raw_max_messages = payload.get("max_messages")
+        max_messages = int(raw_max_messages) if raw_max_messages not in (None, "") else None
+        dry_run = parse_bool(str(payload.get("dry_run", "true")), default=True)
+        allow_copy_delete_fallback = parse_bool(str(payload.get("allow_copy_delete_fallback", "false")), default=False)
+        job_id = create_job("process")
+        thread = Thread(
+            target=run_process_job,
+            args=(job_id, config, max_messages, dry_run, allow_copy_delete_fallback),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({"ok": True, "job_id": job_id})
+
+    @app.get("/api/jobs/<job_id>")
+    def api_job_status(job_id: str) -> Response:
+        with jobs_lock:
+            job = jobs.get(job_id)
+            if not job:
+                return jsonify({"ok": False, "error": "Job not found"}), 404
+            return jsonify({"ok": True, "job": job})
+
+    return app
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -721,16 +945,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="If MOVE is unavailable, allow COPY + \\Deleted + EXPUNGE fallback",
     )
 
+    serve = sub.add_parser("serve", help="Run a Flask web UI for config and event-oriented execution")
+    serve.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
+    serve.add_argument("--port", type=int, default=8080, help="HTTP port")
+    serve.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
+
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    settings = Settings.from_env()
-
     if args.command == "scan":
+        settings = Settings.from_env()
         scan_phase(settings, sample_size=args.sample_size, max_categories=args.max_categories)
     elif args.command == "process":
+        settings = Settings.from_env()
         process_phase(
             settings,
             batch_size=args.batch_size,
@@ -738,6 +967,9 @@ def main(argv: list[str]) -> int:
             dry_run=args.dry_run,
             allow_copy_delete_fallback=args.allow_copy_delete_fallback,
         )
+    elif args.command == "serve":
+        app = create_web_app()
+        app.run(host=args.host, port=args.port, debug=args.debug)
     else:
         raise RuntimeError(f"Unknown command: {args.command}")
     return 0

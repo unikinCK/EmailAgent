@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>EmailAgent Web UI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <main class="layout">
+    <section class="card">
+      <h1>EmailAgent Control Center</h1>
+      <p class="subtitle">Konfiguration speichern und Scan/Process event-orientiert starten.</p>
+
+      <h2>Konfiguration</h2>
+      <form id="config-form" class="grid"></form>
+      <div class="actions">
+        <button id="save-config" class="btn primary">Konfiguration speichern</button>
+        <button id="reload-config" class="btn">Neu laden</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Aktionen</h2>
+      <div class="grid compact">
+        <label>Sample Size <input id="scan-sample-size" type="number" value="600" /></label>
+        <label>Max Kategorien <input id="scan-max-categories" type="number" value="12" /></label>
+      </div>
+      <button id="start-scan" class="btn primary">Scan starten</button>
+
+      <hr />
+
+      <div class="grid compact">
+        <label>Max Messages <input id="process-max-messages" type="number" placeholder="leer = alle" /></label>
+        <label><input id="process-dry-run" type="checkbox" checked /> Dry Run</label>
+        <label><input id="process-fallback" type="checkbox" /> Copy/Delete Fallback</label>
+      </div>
+      <button id="start-process" class="btn danger">Process starten</button>
+    </section>
+
+    <section class="card logs">
+      <h2>Event Log</h2>
+      <p id="job-status">Kein Job aktiv.</p>
+      <pre id="log-output"></pre>
+    </section>
+  </main>
+
+  <script>
+    const fields = [
+      'IMAP_HOST','IMAP_PORT','IMAP_USER','IMAP_PASSWORD','IMAP_MAILBOX','IMAP_SENT_MAILBOX','IMAP_TLS',
+      'LLM_ENDPOINT','LLM_MODEL','LLM_API_KEY','LLM_TIMEOUT_SECONDS','LLM_TEMPERATURE','LLM_MAX_TOKENS',
+      'LLM_MAX_CONTEXT_TOKENS','LLM_INPUT_TOKEN_BUDGET','STATE_DIR'
+    ];
+
+    const form = document.getElementById('config-form');
+    const jobStatus = document.getElementById('job-status');
+    const logOutput = document.getElementById('log-output');
+    let activeJob = null;
+    let pollHandle = null;
+
+    function renderConfig(config) {
+      form.innerHTML = '';
+      fields.forEach((key) => {
+        const label = document.createElement('label');
+        label.textContent = key;
+        const input = document.createElement('input');
+        input.name = key;
+        input.value = config[key] || '';
+        if (key.includes('PASSWORD') || key.includes('API_KEY')) {
+          input.type = 'password';
+        }
+        label.appendChild(input);
+        form.appendChild(label);
+      });
+    }
+
+    async function loadConfig() {
+      const res = await fetch('/api/config');
+      const data = await res.json();
+      renderConfig(data.config || {});
+    }
+
+    async function saveConfig() {
+      const cfg = {};
+      new FormData(form).forEach((v, k) => cfg[k] = String(v));
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: cfg })
+      });
+    }
+
+    function showLogs(job) {
+      jobStatus.textContent = `Job ${job.id} (${job.name}) Status: ${job.status}`;
+      const lines = (job.logs || []).map(item => `[${new Date(item.ts * 1000).toISOString()}] ${item.message}`);
+      logOutput.textContent = lines.join('\n');
+      logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    async function pollJob(jobId) {
+      if (pollHandle) clearInterval(pollHandle);
+      activeJob = jobId;
+      pollHandle = setInterval(async () => {
+        const res = await fetch(`/api/jobs/${activeJob}`);
+        const data = await res.json();
+        if (!data.ok) return;
+        showLogs(data.job);
+        if (['done', 'error'].includes(data.job.status)) {
+          clearInterval(pollHandle);
+          pollHandle = null;
+        }
+      }, 1000);
+    }
+
+    async function startScan() {
+      await saveConfig();
+      const res = await fetch('/api/run/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sample_size: Number(document.getElementById('scan-sample-size').value || 600),
+          max_categories: Number(document.getElementById('scan-max-categories').value || 12)
+        })
+      });
+      const data = await res.json();
+      await pollJob(data.job_id);
+    }
+
+    async function startProcess() {
+      await saveConfig();
+      const maxMessagesRaw = document.getElementById('process-max-messages').value;
+      const res = await fetch('/api/run/process', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          max_messages: maxMessagesRaw,
+          dry_run: document.getElementById('process-dry-run').checked,
+          allow_copy_delete_fallback: document.getElementById('process-fallback').checked,
+        })
+      });
+      const data = await res.json();
+      await pollJob(data.job_id);
+    }
+
+    document.getElementById('save-config').addEventListener('click', async (e) => {
+      e.preventDefault();
+      await saveConfig();
+    });
+    document.getElementById('reload-config').addEventListener('click', async (e) => {
+      e.preventDefault();
+      await loadConfig();
+    });
+    document.getElementById('start-scan').addEventListener('click', startScan);
+    document.getElementById('start-process').addEventListener('click', startProcess);
+
+    loadConfig();
+  </script>
+</body>
+</html>
