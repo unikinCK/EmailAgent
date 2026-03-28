@@ -73,7 +73,7 @@ class Settings:
             llm_model=env("LLM_MODEL", "local-model"),
             llm_api_key=env("LLM_API_KEY", ""),
             llm_timeout_seconds=int(env("LLM_TIMEOUT_SECONDS", "120")),
-            llm_temperature=float(env("LLM_TEMPERATURE", "0.1")),
+            llm_temperature=float(env("LLM_TEMPERATURE", "0")),
             llm_max_tokens=int(env("LLM_MAX_TOKENS", "700")),
             llm_max_context_tokens=int(env("LLM_MAX_CONTEXT_TOKENS", "8000")),
             llm_input_token_budget=int(env("LLM_INPUT_TOKEN_BUDGET", "6000")),
@@ -195,6 +195,22 @@ class LocalLLM:
             "snippet": msg.snippet[:snippet_chars],
         }
 
+    def _request_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        retries: int = 1,
+    ) -> dict | None:
+        for attempt in range(retries + 1):
+            try:
+                response = self._post(messages, max_tokens=max_tokens)
+                return parse_json_from_text(self._extract_content(response))
+            except Exception:
+                if attempt >= retries:
+                    return None
+        return None
+
     def build_categories(self, samples: list[MessageSummary], max_categories: int) -> CategoryPlan:
         if not samples:
             return CategoryPlan(
@@ -246,14 +262,15 @@ class LocalLLM:
             f"Existing categories:\n{json.dumps(existing_categories, ensure_ascii=False)}\n\n"
             f"Email:\n{json.dumps(self._compact_message(sample, snippet_chars=160), ensure_ascii=False)}"
         )
-        response = self._post(
+        data = self._request_json(
             [
                 {"role": "system", "content": "Return strict JSON only."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=500,
         )
-        data = parse_json_from_text(self._extract_content(response))
+        if data is None:
+            return self._normalize_categories(existing_categories, max_categories=max_categories)
         categories = data.get("categories", [])
         if not isinstance(categories, list):
             return self._normalize_categories(existing_categories, max_categories=max_categories)
@@ -268,20 +285,21 @@ class LocalLLM:
             "Prefer stable categories like Bills, Receipts, Work, Newsletters, Travel, Alerts, Personal, Vendors, Promotions, Uncategorized.\n\n"
             f"Candidate categories:\n{json.dumps(categories, ensure_ascii=False)}"
         )
-        response = self._post(
+        data = self._request_json(
             [
                 {"role": "system", "content": "Return strict JSON only."},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=700,
         )
-        data = parse_json_from_text(self._extract_content(response))
+        if data is None:
+            return self._normalize_categories(categories, max_categories=max_categories)
         consolidated = data.get("categories", [])
         if not isinstance(consolidated, list):
             return self._normalize_categories(categories, max_categories=max_categories)
         return self._normalize_categories(consolidated, max_categories=max_categories)
 
-    def classify_batch(self, messages: list[MessageSummary], categories: list[dict[str, str]]) -> dict[str, str]:
+    def classify_batch(self, messages: list[MessageSummary], categories: list[dict[str, str]]) -> dict[str, str] | None:
         prompt_intro = (
             "Classify each message into one category name from categories. "
             "Use provided metadata like flags and replied_in_sent as context signals, but still classify every message. "
@@ -304,14 +322,14 @@ class LocalLLM:
             only = messages[0]
             payload["messages"] = [self._compact_message(only, snippet_chars=60)]
             prompt = f"{prompt_intro}\nINPUT:\n{json.dumps(payload, ensure_ascii=False)}"
-        response = self._post(
+        data = self._request_json(
             [
                 {"role": "system", "content": "Return strict JSON only."},
                 {"role": "user", "content": prompt},
             ],
         )
-        content = self._extract_content(response)
-        data = parse_json_from_text(content)
+        if data is None:
+            return None
         assignments = data.get("assignments", [])
         result: dict[str, str] = {}
         valid = {c["name"] for c in categories}
@@ -677,6 +695,11 @@ def process_phase(
             for msg in summaries:
                 msg.replied_in_sent = normalize_subject(msg.subject) in sent_references
             assignments = llm.classify_batch(summaries, categories)
+            if assignments is None:
+                skipped += len(summaries)
+                first_uid = summaries[0].uid if summaries else "n/a"
+                print(f"[WARN] classification failed twice for batch starting uid={first_uid}; skipping.")
+                continue
             for msg in summaries:
                 target = assignments.get(msg.uid, "Uncategorized")
                 if dry_run:
