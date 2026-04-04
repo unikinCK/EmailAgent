@@ -41,6 +41,19 @@
     <section class="card logs">
       <h2>Event Log</h2>
       <p id="job-status">Kein Job aktiv.</p>
+      <div class="status-panel">
+        <label>Fortschritt (0-100%)</label>
+        <div class="progress-wrap">
+          <progress id="job-progress" value="0" max="100"></progress>
+          <span id="job-progress-text">0%</span>
+        </div>
+        <p id="job-current-email"><strong>Aktuelle Email:</strong> -</p>
+        <p id="job-last-error"><strong>Letzter Fehler:</strong> -</p>
+        <div>
+          <strong>Kategorien:</strong>
+          <ul id="job-categories"></ul>
+        </div>
+      </div>
       <pre id="log-output"></pre>
     </section>
   </main>
@@ -55,6 +68,11 @@
     const form = document.getElementById('config-form');
     const jobStatus = document.getElementById('job-status');
     const logOutput = document.getElementById('log-output');
+    const jobProgress = document.getElementById('job-progress');
+    const jobProgressText = document.getElementById('job-progress-text');
+    const jobCurrentEmail = document.getElementById('job-current-email');
+    const jobLastError = document.getElementById('job-last-error');
+    const jobCategories = document.getElementById('job-categories');
     let activeJob = null;
     let pollHandle = null;
 
@@ -92,6 +110,15 @@
 
     function showLogs(job) {
       jobStatus.textContent = `Job ${job.id} (${job.name}) Status: ${job.status}`;
+      const percent = Number(job.progress_percent || 0);
+      jobProgress.value = percent;
+      jobProgressText.textContent = `${percent}%`;
+      jobCurrentEmail.textContent = `Aktuelle Email: ${job.current_email || '-'}`;
+      jobLastError.textContent = `Letzter Fehler: ${job.last_error || '-'}`;
+      const categories = Array.isArray(job.categories) ? job.categories : [];
+      jobCategories.innerHTML = categories.length
+        ? categories.map((name) => `<li>${name}</li>`).join('')
+        : '<li>-</li>';
       const lines = (job.logs || []).map(item => `[${new Date(item.ts * 1000).toISOString()}] ${item.message}`);
       logOutput.textContent = lines.join('\n');
       logOutput.scrollTop = logOutput.scrollHeight;
