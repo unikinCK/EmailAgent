@@ -614,6 +614,8 @@ def scan_phase(
     sample_size: int,
     max_categories: int,
     out: Callable[..., None] = print,
+    progress: Callable[[int, int], None] | None = None,
+    current_email: Callable[[str], None] | None = None,
 ) -> None:
     llm = LocalLLM(settings)
     with ImapMailbox(settings) as mailbox:
@@ -629,6 +631,8 @@ def scan_phase(
 
         for uid in sample_uids:
             attempted += 1
+            if progress:
+                progress(attempted, total_to_scan)
             out(
                 f"\rScan progress {render_progress_bar(attempted, total_to_scan)} ({attempted}/{total_to_scan})",
                 end="",
@@ -637,6 +641,8 @@ def scan_phase(
             sample = mailbox.fetch_summaries([uid])
             if not sample:
                 continue
+            if current_email:
+                current_email(sample[0].subject or f"uid={uid}")
             scanned += 1
             before_names = {c["name"] for c in running_categories}
             proposed = llm._propose_categories_for_message(
@@ -668,6 +674,8 @@ def scan_phase(
     categories_file = settings.state_dir / "categories.json"
     categories = ensure_required_categories(plan.categories)
     save_json(categories_file, {"generated_at": int(time.time()), "categories": categories})
+    if progress:
+        progress(total_to_scan, total_to_scan)
     out(f"Saved category plan to: {categories_file}")
     for c in categories:
         out(f"- {c['name']}: {c['description']}")
@@ -680,6 +688,9 @@ def process_phase(
     dry_run: bool,
     allow_copy_delete_fallback: bool,
     out: Callable[..., None] = print,
+    progress: Callable[[int, int], None] | None = None,
+    current_email: Callable[[str], None] | None = None,
+    last_error: Callable[[str], None] | None = None,
 ) -> None:
     categories_file = settings.state_dir / "categories.json"
     if not categories_file.exists():
@@ -727,11 +738,14 @@ def process_phase(
             )
         effective_batch_size = 1
         out(f"Processing {len(all_uids)} messages with effective batch size of {effective_batch_size}")
+        if progress:
+            progress(0, len(all_uids))
         for c in categories:
             mailbox.ensure_folder(c["name"])
 
         moved = 0
         skipped = 0
+        processed = 0
         for i in range(0, len(all_uids), effective_batch_size):
             batch_uids = all_uids[i : i + effective_batch_size]
             summaries = mailbox.fetch_summaries(batch_uids)
@@ -741,13 +755,24 @@ def process_phase(
             if assignments is None:
                 skipped += len(summaries)
                 first_uid = summaries[0].uid if summaries else "n/a"
-                print(f"[WARN] classification failed twice for batch starting uid={first_uid}; skipping.")
+                warn = f"classification failed twice for batch starting uid={first_uid}; skipping."
+                out(f"[WARN] {warn}")
+                if last_error:
+                    last_error(warn)
+                processed += len(summaries)
+                if progress:
+                    progress(processed, len(all_uids))
                 continue
             for msg in summaries:
+                if current_email:
+                    current_email(msg.subject or f"uid={msg.uid}")
                 target = assignments.get(msg.uid, "Uncategorized")
                 if dry_run:
                     out(f"[DRY-RUN] uid={msg.uid} -> {target} | {msg.subject[:70]}")
                     skipped += 1
+                    processed += 1
+                    if progress:
+                        progress(processed, len(all_uids))
                     continue
                 if supports_move:
                     ok = mailbox.move_uid(msg.uid, target)
@@ -760,7 +785,13 @@ def process_phase(
                     moved += 1
                 else:
                     skipped += 1
-                    out(f"[WARN] failed to move uid={msg.uid} to {target}")
+                    warn = f"failed to move uid={msg.uid} to {target}"
+                    out(f"[WARN] {warn}")
+                    if last_error:
+                        last_error(warn)
+                processed += 1
+                if progress:
+                    progress(processed, len(all_uids))
         out(f"Done. moved={moved}, skipped={skipped}, dry_run={dry_run}")
 
 
@@ -830,6 +861,12 @@ def create_web_app() -> Flask:
                 "name": name,
                 "status": "queued",
                 "logs": [],
+                "progress_current": 0,
+                "progress_total": 0,
+                "progress_percent": 0,
+                "current_email": "",
+                "last_error": "",
+                "categories": [],
                 "created_at": int(time.time()),
                 "updated_at": int(time.time()),
             }
@@ -849,8 +886,34 @@ def create_web_app() -> Flask:
             jobs[job_id]["status"] = status
             jobs[job_id]["updated_at"] = int(time.time())
 
+    def set_progress(job_id: str, current: int, total: int) -> None:
+        bounded_total = max(0, total)
+        bounded_current = max(0, min(current, bounded_total if bounded_total else current))
+        percent = int((bounded_current / bounded_total) * 100) if bounded_total else 0
+        with jobs_lock:
+            jobs[job_id]["progress_current"] = bounded_current
+            jobs[job_id]["progress_total"] = bounded_total
+            jobs[job_id]["progress_percent"] = percent
+            jobs[job_id]["updated_at"] = int(time.time())
+
+    def set_current_email(job_id: str, value: str) -> None:
+        with jobs_lock:
+            jobs[job_id]["current_email"] = value
+            jobs[job_id]["updated_at"] = int(time.time())
+
+    def set_last_error(job_id: str, value: str) -> None:
+        with jobs_lock:
+            jobs[job_id]["last_error"] = value
+            jobs[job_id]["updated_at"] = int(time.time())
+
+    def set_categories(job_id: str, categories: list[str]) -> None:
+        with jobs_lock:
+            jobs[job_id]["categories"] = categories
+            jobs[job_id]["updated_at"] = int(time.time())
+
     def fail_job(job_id: str, error: str) -> None:
         append_log(job_id, f"[ERROR] {error}")
+        set_last_error(job_id, error)
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = error
@@ -860,7 +923,19 @@ def create_web_app() -> Flask:
         set_status(job_id, "running")
         try:
             settings = Settings.from_mapping(config)
-            scan_phase(settings, sample_size=sample_size, max_categories=max_categories, out=lambda *a, **k: append_log(job_id, " ".join(str(x) for x in a)))
+            scan_phase(
+                settings,
+                sample_size=sample_size,
+                max_categories=max_categories,
+                out=lambda *a, **k: append_log(job_id, " ".join(str(x) for x in a)),
+                progress=lambda current, total: set_progress(job_id, current, total),
+                current_email=lambda value: set_current_email(job_id, value),
+            )
+            categories_path = settings.state_dir / "categories.json"
+            if categories_path.exists():
+                data = load_json(categories_path)
+                cat_names = [str(item.get("name", "")) for item in data.get("categories", []) if item.get("name")]
+                set_categories(job_id, cat_names)
             set_status(job_id, "done")
         except Exception as exc:
             fail_job(job_id, str(exc))
@@ -875,6 +950,11 @@ def create_web_app() -> Flask:
         set_status(job_id, "running")
         try:
             settings = Settings.from_mapping(config)
+            categories_path = settings.state_dir / "categories.json"
+            if categories_path.exists():
+                data = load_json(categories_path)
+                cat_names = [str(item.get("name", "")) for item in data.get("categories", []) if item.get("name")]
+                set_categories(job_id, cat_names)
             process_phase(
                 settings,
                 batch_size=1,
@@ -882,6 +962,9 @@ def create_web_app() -> Flask:
                 dry_run=dry_run,
                 allow_copy_delete_fallback=allow_copy_delete_fallback,
                 out=lambda *a, **k: append_log(job_id, " ".join(str(x) for x in a)),
+                progress=lambda current, total: set_progress(job_id, current, total),
+                current_email=lambda value: set_current_email(job_id, value),
+                last_error=lambda value: set_last_error(job_id, value),
             )
             set_status(job_id, "done")
         except Exception as exc:
