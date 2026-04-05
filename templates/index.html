@@ -8,7 +8,7 @@
 </head>
 <body>
   <main class="layout">
-    <section class="card">
+    <section class="card card-config">
       <h1>EmailAgent Control Center</h1>
       <p class="subtitle">Konfiguration speichern und Scan/Process event-orientiert starten.</p>
 
@@ -20,7 +20,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card card-actions">
       <h2>Aktionen</h2>
       <div class="grid compact">
         <label>Sample Size <input id="scan-sample-size" type="number" value="600" /></label>
@@ -32,8 +32,8 @@
 
       <div class="grid compact">
         <label>Max Messages <input id="process-max-messages" type="number" placeholder="leer = alle" /></label>
-        <label><input id="process-dry-run" type="checkbox" checked /> Dry Run</label>
-        <label><input id="process-fallback" type="checkbox" /> Copy/Delete Fallback</label>
+        <label class="checkbox-row"><input id="process-dry-run" type="checkbox" checked /> Dry Run</label>
+        <label class="checkbox-row"><input id="process-fallback" type="checkbox" /> Copy/Delete Fallback</label>
       </div>
       <button id="start-process" class="btn danger">Process starten</button>
     </section>
